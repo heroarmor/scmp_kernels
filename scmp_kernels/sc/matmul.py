@@ -28,6 +28,7 @@ from .kernels import (
     _sc_matmul_per_head_bipolar,
 )
 from ..quant.smoothquant import apply_smoothing
+from .. import trace as _trace
 
 
 _VALID_GRANULARITIES = ("per_tensor", "per_row", "per_head")
@@ -219,6 +220,31 @@ def _sc_matmul_impl(
             raise ValueError(
                 f"sc_matmul: granularity='per_head' currently only supports "
                 f"mode='bipolar', got '{mode}'.")
+
+    # ---- precision trace (see scmp_kernels/trace.py) -------------------------
+    # Host-side shape metadata only — no tensor reads, no device sync. The
+    # bool guard keeps the off-path cost at one attribute read. Placed after
+    # the validation gates so rejected calls are never recorded, and after the
+    # halving block so stoc_len is the TRUE cycle count.
+    if _trace._ENABLED:
+        if a.dim() == 3:
+            _batch, _rows, _d_in = a.shape
+        else:
+            _rows, _d_in = a.shape
+            _batch = 1
+        _trace.record_matmul(
+            rows=int(_rows), d_in=int(_d_in), d_out=int(b.shape[-2]),
+            batch=int(_batch),
+            stoc_len=int(stoc_len) if stoc_len is not None else 2 ** sc_prec,
+            sc_prec=sc_prec, mode=mode, granularity=granularity,
+            halve=bool(halve_bipolar_stoc_len),
+            # RESOLVED enable-grid size (mirrors _resolve_rng_levels), so the
+            # field has one meaning across halved and non-halved runs.
+            rng_levels=(int(rng_levels) if rng_levels is not None
+                        else 2 ** sc_prec),
+            chunk_d=chunk_d,
+            smoothed=smooth_scales is not None,
+        )
 
     # ---- dispatch ------------------------------------------------------------
     if granularity == "per_tensor":
