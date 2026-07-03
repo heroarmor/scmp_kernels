@@ -4,11 +4,14 @@ kernel level on captured real operands.
 Axes (all crossed):
   * stoc_len   in {256,192,128,96,64,48,32,16}   (stream length)
   * halve      in {off, on}    (uSystolic: on -> RNG enable-grid = 2^(prec-1))
-  * scramble   in {off, counter, bitrev}  (Owen de-bias mode; off = ablation baseline)
+  * scramble   in {off, bitrev}  (Owen de-bias mode; off = ablation baseline;
+                 counter / SC_SCRAMBLE_RESCALE / SC_DISABLE_OWEN were removed —
+                 scramble-before-rescale is always on, mode=off disables it)
 
-Fixed: per_row, bipolar, sc_prec=8, chunk_d=128. SC_SCRAMBLE_RESCALE follows
-the scramble setting (1 unless scramble=off). Metric: rel_fro vs exact a @ b.T,
-meaned over the captured tensors. RNG cache cleared before every call.
+Fixed: per_row, bipolar, sc_prec=8, chunk_d=128. Bitrev mask count follows
+SC_SCRAMBLE_MASKS (kernel default 64; set 256 for pre-2026-06-03 parity).
+Metric: rel_fro vs exact a @ b.T, meaned over the captured tensors. RNG cache
+cleared before every call.
 
     python bench/ablation.py --tensors bench/captured_llama8b.pt
 """
@@ -21,7 +24,7 @@ from scmp_kernels.sc import clear_rng_cache
 SC_PREC, CHUNK_D = 8, 128
 STOC_LENS = [256, 192, 128, 96, 64, 48, 32, 16]
 HALVES = [("full", False), ("halve", True)]
-SCRAMBLES = ["off", "counter", "bitrev"]   # off = ablation baseline
+SCRAMBLES = ["off", "bitrev"]   # off = ablation baseline (counter removed)
 
 
 def mse(sc, ref):
@@ -50,9 +53,10 @@ def main():
         for sl in stoc_lens:
             for hlab, halve in HALVES:
                 for scr in scrambles:
+                    # mode=off alone now reproduces the old (off, RESCALE=0)
+                    # fully-unscrambled baseline: the always-on scramble call
+                    # is an identity when the mode is off.
                     os.environ["SC_OWEN_MODE"] = scr
-                    os.environ["SC_SCRAMBLE_RESCALE"] = "0" if scr == "off" else "1"
-                    os.environ.pop("SC_DISABLE_OWEN", None)
                     clear_rng_cache()
                     sc = sc_matmul(a, b, granularity="per_row", mode="bipolar",
                                    sc_prec=SC_PREC, stoc_len=sl, chunk_d=CHUNK_D,

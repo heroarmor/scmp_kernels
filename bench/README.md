@@ -44,7 +44,11 @@ Or via Slurm: `sbatch bench/_sbatch_ablation.sh`.
 - **Swept axes:**
   - `stoc_len ∈ {256,192,128,96,64,48,32,16}` — stream length (cycles).
   - `halve ∈ {off,on}` — uSystolic: `on` sets the RNG enable-grid to `2^(prec-1)=128` levels (vs `2^prec=256`). Independent of `stoc_len`.
-  - `scramble ∈ {off,counter,bitrev}` — Owen de-bias mode (`SC_OWEN_MODE`; `off` also clears `SC_SCRAMBLE_RESCALE`).
+  - `scramble ∈ {off,bitrev}` — Owen de-bias mode (`SC_OWEN_MODE`). `counter`,
+    `SC_DISABLE_OWEN`, and `SC_SCRAMBLE_RESCALE` were removed (2026-06-03):
+    scramble-before-rescale is always on; `off` disables scrambling entirely.
+    Bitrev mask count `M = min(SC_SCRAMBLE_MASKS, 2^sc_prec)`, default 64 —
+    set `SC_SCRAMBLE_MASKS=256` to reproduce pre-2026-06-03 numbers.
 - **Caveat handled:** the RNG enable-table cache is *not* keyed by scramble mode, so `clear_rng_cache()` is called before every measured matmul.
 
 ## Results (Llama-3.1-8B operands, layers 0/15/31, mean MSE over 21 tensors)

@@ -38,7 +38,7 @@ def main() -> None:
     ap.add_argument("--tensors", default="captured.pt")
     ap.add_argument("--out", default="mse_profile.csv")
     ap.add_argument("--stoc-lens", default="256,128,64,32,16")
-    ap.add_argument("--owen-modes", default="off,counter,bitrev,random")
+    ap.add_argument("--owen-modes", default="off,bitrev,random")
     args = ap.parse_args()
 
     stoc_lens = [int(x) for x in args.stoc_lens.split(",")]
@@ -57,7 +57,6 @@ def main() -> None:
         ref_rms = ref.float().pow(2).mean().sqrt().item()
         for owen in owen_modes:
             os.environ["SC_OWEN_MODE"] = owen
-            os.environ.pop("SC_DISABLE_OWEN", None)
             for sl, halve in sl_configs:
                 clear_rng_cache()
                 sc = sc_matmul(
