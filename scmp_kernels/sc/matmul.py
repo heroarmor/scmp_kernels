@@ -237,7 +237,10 @@ def _sc_matmul_impl(
             batch=int(_batch),
             stoc_len=int(stoc_len) if stoc_len is not None else 2 ** sc_prec,
             sc_prec=sc_prec, mode=mode, granularity=granularity,
-            halve=bool(halve_bipolar_stoc_len),
+            # halving only takes effect in bipolar mode (guard above) — record
+            # whether it was APPLIED, not merely requested, to keep the field
+            # consistent with the effective stoc_len/rng_levels.
+            halve=bool(halve_bipolar_stoc_len and mode == "bipolar"),
             # RESOLVED enable-grid size (mirrors _resolve_rng_levels), so the
             # field has one meaning across halved and non-halved runs.
             rng_levels=(int(rng_levels) if rng_levels is not None

@@ -236,10 +236,21 @@ def record_matmul(*, rows: int, d_in: int, d_out: int, batch: int,
 
 
 def _header() -> dict:
-    """Static config snapshot written once per output file."""
+    """Static config snapshot written once per output file.
+
+    ``scramble_masks`` is the env-knob ECHO (int when parseable), not the
+    per-call resolved mask count — that is ``min(scramble_masks,
+    2**sc_prec)`` using each record's own ``sc_prec``, and it only applies
+    when ``owen_mode`` is ``bitrev``."""
+    try:
+        masks = int(os.environ.get("SC_SCRAMBLE_MASKS", "64"))
+    except ValueError:
+        # Garbage env value: echo it raw rather than crash flush() — the
+        # kernel's own validation raises at matmul time, not here.
+        masks = os.environ.get("SC_SCRAMBLE_MASKS")
     return {
         "owen_mode": os.environ.get("SC_OWEN_MODE", "bitrev"),
-        "scramble_masks": os.environ.get("SC_SCRAMBLE_MASKS", "64 (default)"),
+        "scramble_masks": masks,
         "mode": _MODE,
         "n_records": _SEQ,
         "coverage": "sc_matmul only — FP16 ops (lm_head, embeddings, MoE "
@@ -267,10 +278,14 @@ def flush(path: Optional[str] = None, header_extra: Optional[dict] = None,
                       f"trace already spilled to {_PATH!r}.", file=sys.stderr)
             for rec in _TRACE:
                 _FH.write(json.dumps(rec) + "\n")
+            # The header line (written at first spill) has n_records=null —
+            # the final count is only known now. ALWAYS append the trailer so
+            # the file carries its count even for a bare flush(); merge any
+            # caller metadata into it.
+            trailer = {"trailer": True, "n_records": _SEQ}
             if header_extra:
-                # header line was already written; append a trailer record.
-                _FH.write(json.dumps({"trailer": True, "n_records": _SEQ,
-                                      **header_extra}) + "\n")
+                trailer.update(header_extra)
+            _FH.write(json.dumps(trailer) + "\n")
             _FH.close()
             _FH = None
             out = _PATH
