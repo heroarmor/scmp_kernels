@@ -652,21 +652,33 @@ def _bit_reverse(x: torch.Tensor, n_bits: int) -> torch.Tensor:
     return y
 
 
-def _scramble_mask_count(base_levels: int) -> int:
-    """Resolve M = min(SC_SCRAMBLE_MASKS, base_levels) for bitrev scrambling.
+# Hardware realizes at most this many DISTINCT scramble patterns (a log2(M)-bit
+# mask selector). This is the BINDING cap — M cannot exceed it in silicon, so
+# requesting more (e.g. SC_SCRAMBLE_MASKS=256) is a simulation-only "ideal" and
+# is clamped here rather than silently pretending the hardware could do it.
+HW_MAX_MASKS = 64
 
-    SC_SCRAMBLE_MASKS defaults to 64 (a 6-bit mask pattern). Must be a power
-    of two so the bit reversal is a bijection on [0, M)."""
+
+def _scramble_mask_count(base_levels: int) -> int:
+    """Resolve M = min(SC_SCRAMBLE_MASKS, HW_MAX_MASKS, base_levels).
+
+    SC_SCRAMBLE_MASKS defaults to 64. Capped at HW_MAX_MASKS (hardware pattern
+    limit; the binding constraint) and at base_levels (there are only that many
+    distinct scramble values, so >base_levels would alias under the fixed-width
+    bit reversal). Must be a power of two so bit reversal is a bijection on
+    [0, M). Note: the mask WIDTH is log2(base_levels) regardless of M — a small
+    M reuses fewer distinct patterns but each still scrambles the full width."""
     raw = os.environ.get("SC_SCRAMBLE_MASKS", "").strip()
     k = int(raw) if raw else _DEFAULT_SCRAMBLE_MASKS
     if k <= 0:
         raise ValueError(
             f"SC_SCRAMBLE_MASKS must be a positive power of two, got {k}.")
-    m = min(k, base_levels)
+    m = min(k, HW_MAX_MASKS, base_levels)
     if m & (m - 1):
         raise ValueError(
             f"SC_SCRAMBLE_MASKS must be a power of two, got {k} "
-            f"(effective M={m} after min with base_levels={base_levels}).")
+            f"(effective M={m} after min with HW_MAX_MASKS={HW_MAX_MASKS}, "
+            f"base_levels={base_levels}).")
     return m
 
 
@@ -684,7 +696,17 @@ def _owen_scramble(prefix: torch.Tensor, base_levels: int) -> torch.Tensor:
 
     if mode == "bitrev":
         m = _scramble_mask_count(base_levels)
-        n_bits = int(round(math.log2(m)))
+        # M distinct masks (the per-dim pattern is period-m in d, i.e. only M
+        # different scrambles — the intended hardware knob), but each mask is a
+        # FULL-WIDTH scramble: bit-reverse over log2(base_levels) bits, NOT
+        # log2(m). Reversing over log2(m) left the top log2(base_levels/m) bits
+        # — the coarsest, largest-magnitude strata — UNSCRAMBLED (M=64, prec=8 =>
+        # only the low 6 of 8 bits moved), which reintroduces the systematic
+        # Sobol-prefix bias on the high strata and craters quality (4B int7 MP
+        # ~15 -> ~30). With full-width reversal, d mod M still yields exactly M
+        # distinct masks, but they spread across the high (coarse) bits where
+        # decorrelation matters.
+        n_bits = int(round(math.log2(base_levels)))
         idx = torch.arange(D, device=prefix.device, dtype=torch.int64) % m
         masks = _bit_reverse(idx, n_bits).to(prefix.dtype).unsqueeze(1)
     elif mode == "random":  # legacy fixed-seed PRNG
