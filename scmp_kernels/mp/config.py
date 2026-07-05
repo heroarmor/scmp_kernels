@@ -336,6 +336,15 @@ def adaptive_classify_rows(
     levels = config.stoc_len_levels
     n_levels = len(levels)
 
+    # Empty row batch — e.g. a MoE expert that received ZERO tokens this forward
+    # (sparse top-k routing). metric is empty, so .min()/.argsort() below would
+    # crash on the empty reduction. Return an empty assignment; the caller's
+    # per-level dispatch loop then does nothing (empty expert → empty output).
+    if N == 0:
+        empty = torch.empty(0, dtype=torch.long, device=metric.device)
+        return RowAssignment(row_levels=empty,
+                             level_row_indices={sl: empty for sl in levels})
+
     # ---------- Free-boundary path (FreeBoundaryMPConfig) ----------
     # Per-(block, op) learned boundaries; no alpha/beta/progress dependency.
     # Check subclass first so inherited isinstance(cfg, AdaptiveMPConfig)
