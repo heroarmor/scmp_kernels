@@ -22,12 +22,13 @@ All inputs/outputs are float32; quantization happens inside the Triton kernels.
 """
 
 from .matmul import sc_matmul
-from .conv import sc_conv2d
+from .conv import sc_conv2d, conv2d_lowered_rows
 from .kernels import clear_rng_cache, det_kernel_tuning
 
 __all__ = [
     "sc_matmul",
     "sc_conv2d",
+    "conv2d_lowered_rows",
     "clear_rng_cache",
     "det_kernel_tuning",
 ]
