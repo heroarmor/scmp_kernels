@@ -210,11 +210,8 @@ class AdaptiveMPConfig:
          timestep_bucket, layer_bucket) thresholds from
          ``calibrate_mp_thresholds.py``.
 
-    There is no closed-form fallback. The earlier ``alpha * progress + beta``
-    dynamic-threshold mode was removed — it was unused by every consumer and
-    only added a confusing path alongside the calibrated table. A classify
-    call that matches none of the three paths is a configuration bug and
-    raises.
+    There is no closed-form fallback: a classify call that matches none of the
+    three data-driven paths is a configuration bug and raises.
 
     Args:
         stoc_len_levels: Descending list of stoc_len values.
@@ -346,7 +343,7 @@ def adaptive_classify_rows(
                              level_row_indices={sl: empty for sl in levels})
 
     # ---------- Free-boundary path (FreeBoundaryMPConfig) ----------
-    # Per-(block, op) learned boundaries; no alpha/beta/progress dependency.
+    # Per-(block, op) learned boundaries; no timestep/progress dependency.
     # Check subclass first so inherited isinstance(cfg, AdaptiveMPConfig)
     # dispatch still works elsewhere while we dispatch correctly here.
     if isinstance(config, FreeBoundaryMPConfig):
@@ -357,7 +354,7 @@ def adaptive_classify_rows(
         return _classify_with_free_boundaries(metric, boundaries, levels)
 
     # ---------- Quantile path (target_fractions set) ----------
-    # Independent of (t, T) / alpha / beta. Top frac[0] rows -> levels[0], etc.
+    # Independent of (t, T). Top frac[0] rows -> levels[0], etc.
     if config.target_fractions is not None:
         sorted_idx = metric.argsort(descending=True)
         row_levels_q = torch.empty(N, dtype=torch.long, device=metric.device)
@@ -426,8 +423,8 @@ class FreeBoundaryMPConfig(AdaptiveMPConfig):
 
     Subclasses ``AdaptiveMPConfig`` so existing ``isinstance(cfg,
     AdaptiveMPConfig)`` dispatch in the SC attention patch continues to
-    fire. The inherited ``alpha`` / ``beta`` / ``target_fractions`` fields
-    are ignored when the classifier takes the free-boundary branch.
+    fire. The inherited ``target_fractions`` field is ignored when the
+    classifier takes the free-boundary branch.
 
     Boundaries are keyed by ``(block_idx, op_name)``; block_idx is read
     from the module-level ``_CURRENT_BLOCK_IDX`` at classification time
