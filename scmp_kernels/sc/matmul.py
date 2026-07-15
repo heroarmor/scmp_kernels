@@ -138,7 +138,10 @@ def _sc_matmul_impl(
             RNG grid of size ``2 ** (sc_prec - 1)`` are sufficient. When
             ``True`` and ``mode == "bipolar"``, any ``stoc_len`` /
             ``rng_levels`` left at ``None`` are overridden to
-            ``2 ** (sc_prec - 1)`` (≈2× fewer cycles, same magnitude grid).
+            ``2 ** (sc_prec - 1)`` (≈2× fewer cycles, same magnitude grid),
+            and explicit values above ``2 ** (sc_prec - 1)`` raise
+            ``ValueError`` — such streams are unrealizable on halve hardware
+            and would silently inflate simulated accuracy.
             Has no effect when ``mode == "unipolar"``. Default ``False``
             preserves legacy behavior.
         smooth_scales: optional ``(D,)`` SmoothQuant per-channel scaling
@@ -160,6 +163,9 @@ def _sc_matmul_impl(
         ValueError: if ``granularity="per_head"`` is requested with a non-3D
             input, or with ``mode != "bipolar"``.
         ValueError: for unknown ``granularity`` or ``mode`` values.
+        ValueError: if ``halve_bipolar_stoc_len=True`` (bipolar) is combined
+            with an explicit ``stoc_len`` or ``rng_levels`` above
+            ``2 ** (sc_prec - 1)``.
     """
     if granularity not in _VALID_GRANULARITIES:
         raise ValueError(
@@ -178,8 +184,24 @@ def _sc_matmul_impl(
         halved = 2 ** (sc_prec - 1)
         if stoc_len is None:
             stoc_len = halved
+        elif stoc_len > halved:
+            # Halve hardware's canonical full stream is 2^(sc_prec-1) cycles;
+            # longer streams only re-sample the halved RNG grid — extra joint
+            # (a, b) coverage the hardware cannot realize. Accepting them here
+            # silently inflates simulated accuracy (and any cycle budget built
+            # on top), so reject loudly instead of clamping.
+            raise ValueError(
+                f"sc_matmul: stoc_len={stoc_len} exceeds the halve-mode "
+                f"maximum 2^(sc_prec-1)={halved} (sc_prec={sc_prec}). "
+                f"Streams longer than {halved} are unrealizable with "
+                f"halve_bipolar_stoc_len=True.")
         if rng_levels is None:
             rng_levels = halved
+        elif rng_levels > halved:
+            raise ValueError(
+                f"sc_matmul: rng_levels={rng_levels} exceeds the halve-mode "
+                f"grid 2^(sc_prec-1)={halved} (sc_prec={sc_prec}); the "
+                f"sign-magnitude grid only has {halved} levels.")
 
     # ---- SmoothQuant pre-transform ------------------------------------------
     # Migrate per-channel activation outliers into the weight via a
