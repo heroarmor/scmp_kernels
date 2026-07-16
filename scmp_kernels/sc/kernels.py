@@ -638,8 +638,12 @@ def _resolve_rng_levels(sc_prec: int, rng_levels: Optional[int]) -> int:
 #     stoc_len; it survived only as an ablation and is now retired).
 #
 # Cached enable tables are keyed by (config, sc_prec, stoc_len, rng_levels)
-# but NOT by the scramble mode/seed/mask-count; switching SC_OWEN_MODE or
-# SC_SCRAMBLE_MASKS mid-process requires clear_rng_cache().
+# PLUS a scramble tag (_scramble_cache_tag): resolved mode + mask count for
+# entries whose build actually scrambles (truncated prefix or rescaled grid),
+# and a shared "none" tag for full-length/full-grid entries that never
+# scramble. Switching SC_OWEN_MODE / SC_SCRAMBLE_MASKS mid-process therefore
+# just misses the cache and rebuilds — clear_rng_cache() is no longer needed
+# for correctness (it remains useful to free GPU memory).
 _OWEN_SCRAMBLE_SEED = 0x5A5A5A5A
 _DEFAULT_SCRAMBLE_MASKS = 64
 
@@ -769,6 +773,32 @@ def _enable_table_cache_key(config: dict, sc_prec: int, device: torch.device) ->
     return json.dumps(config, sort_keys=True) + f"|{sc_prec}|{device}|enable"
 
 
+def _scramble_cache_tag(sc_prec: int, stoc_len: int, grid_levels: int) -> str:
+    """Cache-key tag for the scramble parameters baked into enable tables.
+
+    Tables are built from ``_prepare_rng_prefix`` output, which applies the
+    Owen scramble whenever the sequence is truncated (``stoc_len <
+    2**sc_prec``) or rescaled onto a different grid (``grid_levels !=
+    2**sc_prec``). The scramble family / mask count come from env vars
+    (SC_OWEN_MODE / SC_SCRAMBLE_MASKS), so they must be part of the cache
+    key — otherwise switching them mid-process silently reuses stale tables.
+    Full-length, full-grid tables never scramble and share the ``none`` tag
+    across modes (no spurious rebuild on a mode switch).
+    """
+    base_levels = 2 ** sc_prec
+    if stoc_len >= base_levels and grid_levels == base_levels:
+        return "|scr=none"
+    mode = os.environ.get("SC_OWEN_MODE", "bitrev").lower()
+    if mode == "off":
+        return "|scr=off"
+    if mode == "random":
+        return f"|scr=random:{_OWEN_SCRAMBLE_SEED:#x}"
+    # bitrev (default): masks depend on M and the full grid width (sc_prec is
+    # already in the base key). Unknown modes still get a tag here — the
+    # build itself raises in _owen_scramble.
+    return f"|scr={mode}:m{_scramble_mask_count(base_levels)}"
+
+
 def build_enable_tables(
     rng_a: torch.Tensor,
     rng_b: torch.Tensor,
@@ -829,7 +859,9 @@ def _get_cached_enable_tables(
     if stoc_len is None:
         stoc_len = 2 ** sc_prec
     grid_levels = _resolve_rng_levels(sc_prec, rng_levels)
-    key = _enable_table_cache_key(config, sc_prec, device) + f"|sl={stoc_len}|rng={grid_levels}"
+    key = (_enable_table_cache_key(config, sc_prec, device)
+           + f"|sl={stoc_len}|rng={grid_levels}"
+           + _scramble_cache_tag(sc_prec, stoc_len, grid_levels))
     if key not in _enable_table_cache:
         _enable_table_cache[key] = build_enable_tables(
             rng_a, rng_b, sc_prec, stoc_len, rng_levels=grid_levels
@@ -847,7 +879,9 @@ def _get_cached_k_table(
     if stoc_len is None:
         stoc_len = 2 ** sc_prec
     grid_levels = _resolve_rng_levels(sc_prec, rng_levels)
-    key = _enable_table_cache_key(config, sc_prec, device) + f"|k_only|sl={stoc_len}|rng={grid_levels}"
+    key = (_enable_table_cache_key(config, sc_prec, device)
+           + f"|k_only|sl={stoc_len}|rng={grid_levels}"
+           + _scramble_cache_tag(sc_prec, stoc_len, grid_levels))
     if key not in _k_table_cache:
         _k_table_cache[key] = build_k_table_only(
             rng_a, sc_prec, stoc_len, rng_levels=grid_levels
