@@ -229,6 +229,13 @@ class AdaptiveMPConfig:
     # as quantile targets per level (top frac[0] rows -> levels[0], etc.).
     # Length must match stoc_len_levels; sums to 1.
     target_fractions: Optional[list[float]] = None
+    # Protected (salient) input channels: {(operator, block_idx, unit_idx):
+    # [channel indices]} loaded from the table's "protected_channels" section.
+    # Runtime splits these channels into their own SC stream at
+    # ``protected_channel_stoc_len`` and row-dispatches only the residual
+    # channels (see scmp_llm model/sc_common.py SCLinear MP path).
+    protected_channels: dict = field(default_factory=dict)
+    protected_channel_stoc_len: Optional[int] = None
 
     def __post_init__(self):
         assert len(self.stoc_len_levels) >= 2, (
@@ -281,6 +288,51 @@ class AdaptiveMPConfig:
                 len(self.stoc_len_levels),
                 bucket_key,
             )
+
+        # Optional protected-channel section (exported by the LLM/CNN
+        # calibrators' --protect-channel-frac path). Keys are "op:b<N>" or
+        # "op:b<N>:u<M>" (unit = MoE expert index; None for dense modules).
+        self.protected_channels = {}
+        self.protected_channel_stoc_len = None
+        protected = payload.get("protected_channels")
+        if protected:
+            self.protected_channel_stoc_len = int(protected.get("stoc_len", 0)) or None
+            for key_str, indices in protected.get("indices", {}).items():
+                parts = key_str.split(":")
+                if len(parts) < 2 or not parts[1].startswith("b"):
+                    raise ValueError(
+                        f"Invalid protected-channel key '{key_str}'. "
+                        "Expected '<operator>:b<int>[:u<int>]'.")
+                operator = parts[0]
+                block_idx = int(parts[1][1:])
+                unit_idx = None
+                if len(parts) > 2:
+                    if not parts[2].startswith("u"):
+                        raise ValueError(
+                            f"Invalid protected-channel key '{key_str}'.")
+                    unit_idx = int(parts[2][1:])
+                self.protected_channels[(operator, block_idx, unit_idx)] = [
+                    int(i) for i in indices]
+
+    def get_protected_channels(
+        self,
+        operator: Optional[str] = None,
+        block_idx: Optional[int] = None,
+        unit_idx: Optional[int] = None,
+    ) -> list[int]:
+        """Protected input-channel indices for one module (empty when none).
+
+        Looks up (operator, block_idx, unit_idx) first, then falls back to the
+        dense (operator, block_idx, None) entry so per-expert overrides
+        coexist with a shared per-layer list.
+        """
+        if not self.protected_channels or operator is None or block_idx is None:
+            return []
+        key = (operator, int(block_idx), unit_idx)
+        vals = self.protected_channels.get(key)
+        if vals is None and unit_idx is not None:
+            vals = self.protected_channels.get((operator, int(block_idx), None))
+        return vals or []
 
     def get_thresholds(
         self,

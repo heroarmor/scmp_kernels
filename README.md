@@ -69,6 +69,43 @@ kernels. `chunk_d > 0` requires `granularity="per_row"` and `mode="bipolar"`;
 `per_head` requires 3D input and `mode="bipolar"`. Invalid combinations raise
 `ValueError`.
 
+### `sc_conv2d` — SC convolution (built on `sc_matmul`)
+
+The convolution analog of `sc_matmul`: `y = conv2d(x, weight, bias)` with the
+MAC done in SC. It lowers the conv to a matmul and reuses the tuned SC kernels —
+no new Triton code. Dispatch is automatic from the conv geometry:
+
+* **1×1, stride 1, `groups=1`** → pure reshape, **no im2col** (the pointwise-conv
+  fast path — the MAC bulk of MobileNet/EfficientNet).
+* **depthwise** (`groups == Cin == Cout`) → batched 3D matmul, one per channel
+  (im2col is only `kH·kW` columns wide).
+* **general kxk / grouped** → `F.unfold` im2col, then a 2D matmul.
+
+```python
+import torch
+from scmp_kernels import sc_conv2d
+
+x = torch.randn(8, 64, 56, 56, device="cuda")
+w = torch.randn(128, 64, 1, 1, device="cuda")          # 1x1 pointwise -> fast path
+y = sc_conv2d(x, w, stride=1, padding=0, groups=1, sc_prec=8, stoc_len=256)
+
+wd = torch.randn(64, 1, 3, 3, device="cuda")           # depthwise -> batched
+yd = sc_conv2d(x, wd, stride=1, padding=1, groups=64, sc_prec=8)
+```
+
+```
+sc_conv2d(x, weight, bias=None, *,
+    stride=1, padding=0, dilation=1, groups=1,      # nn.Conv2d geometry
+    granularity="per_row", mode="bipolar", sc_prec=8,
+    stoc_len=None, chunk_d=0, halve_bipolar_stoc_len=False,
+    **sc_matmul_kwargs,                             # group_a/b, config, rng_levels, ...
+) -> torch.Tensor        # (B, Cout, Hout, Wout), dtype of x
+```
+
+`x` is `(B, Cin, H, W)`, `weight` is `(Cout, Cin//groups, kH, kW)`. All SC knobs
+forward to `sc_matmul` unchanged; `chunk_d` applies to the 2D paths only (not the
+depthwise 3D path). Requires zero-padding semantics.
+
 Also exported from `scmp_kernels.sc`:
 
 * `clear_rng_cache()` — drop cached RNG sequences (call after changing
