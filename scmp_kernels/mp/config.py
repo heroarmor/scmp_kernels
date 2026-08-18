@@ -116,6 +116,29 @@ def _extract_thresholds(payload, n_levels: int, source: str) -> list[float]:
     return thresholds
 
 
+def _chunk_widths(residual_width: int, chunk_d: int) -> list[int]:
+    """Width of every quantization chunk covering ``residual_width`` channels.
+
+    The trailing chunk is short whenever ``chunk_d`` does not divide the width.
+    Chunk order is ascending, which is what puts the short tail chunk last
+    inside whichever band owns it — the only ordering under which a band's
+    columns re-chunk to the same boundaries the unbanded call would have used.
+    """
+    if chunk_d <= 0:
+        raise ValueError(f"k_bands.chunk_d must be positive, got {chunk_d}.")
+    n_chunks = (residual_width + chunk_d - 1) // chunk_d
+    return [min(chunk_d, residual_width - c * chunk_d) for c in range(n_chunks)]
+
+
+def _band_widths(band_of_chunk: list[int], chunk_widths: list[int],
+                 n_bands: int) -> list[int]:
+    """Channel width of each band, summed over the chunks it owns."""
+    widths = [0] * n_bands
+    for chunk_idx, band in enumerate(band_of_chunk):
+        widths[band] += chunk_widths[chunk_idx]
+    return widths
+
+
 def _classify_rows_by_thresholds(
     metric_norm: torch.Tensor,
     stoc_len_levels: list[int],
@@ -237,6 +260,26 @@ class AdaptiveMPConfig:
     protected_channels: dict = field(default_factory=dict)
     protected_channel_stoc_len: Optional[int] = None
 
+    # ---- K-bands: per-group (contraction-axis) stream lengths -------------
+    # The contraction axis is partitioned into ``k_band_count`` bands of WHOLE
+    # quantization chunks.  Row dispatch is unchanged -- one metric, one rung
+    # index k per row -- but band b executes rung k at its own stream length
+    # ``k_band_ladders[(op, t, l)][b][k]``.  Setting every band's ladder equal
+    # to ``stoc_len_levels`` reproduces the per-row parent exactly, which is
+    # what makes this refinement unable to lose.  Allocations are held to an
+    # exact per-rung iso-compute identity at load (see _load_k_bands).
+    # k_band_count == 0 (the default) disables the whole path.
+    k_band_count: int = 0
+    k_band_chunk_d: int = 128
+    # Fraction of the parent's per-rung budget a band ladder may leave unspent.
+    k_band_underspend_tol: float = 0.05
+    # (operator, block_idx) -> band id per chunk, ascending chunk order
+    k_band_chunks: dict[tuple[str, int], list[int]] = field(default_factory=dict)
+    # (operator, t_bucket, l_bucket) -> [n_bands][n_rungs] stream lengths
+    k_band_ladders: dict[tuple[str, int, int], list[list[int]]] = field(
+        default_factory=dict)
+    # operator -> contraction width the band map was priced against
+    k_band_residual_width: dict[str, int] = field(default_factory=dict)
     def __post_init__(self):
         assert len(self.stoc_len_levels) >= 2, (
             "Need at least 2 levels (high + low or high + skip)")
@@ -273,6 +316,10 @@ class AdaptiveMPConfig:
         self.layer_buckets = int(payload.get("layer_buckets", 1))
         self.operator_default_thresholds = {}
         self.bucket_thresholds = {}
+        self.k_band_count = 0
+        self.k_band_chunks = {}
+        self.k_band_ladders = {}
+        self.k_band_residual_width = {}
 
         for operator, operator_payload in payload.get("operator_defaults", {}).items():
             self.operator_default_thresholds[operator] = _extract_thresholds(
@@ -314,6 +361,8 @@ class AdaptiveMPConfig:
                 self.protected_channels[(operator, block_idx, unit_idx)] = [
                     int(i) for i in indices]
 
+        self._load_k_bands(payload.get("k_bands"))
+
     def get_protected_channels(
         self,
         operator: Optional[str] = None,
@@ -333,6 +382,219 @@ class AdaptiveMPConfig:
         if vals is None and unit_idx is not None:
             vals = self.protected_channels.get((operator, int(block_idx), None))
         return vals or []
+
+    def _load_k_bands(self, section) -> None:
+        """Parse and VALIDATE the optional ``k_bands`` section of an MP table.
+
+        Schema::
+
+            "k_bands": {
+              "n_bands": 4,
+              "chunk_d": 128,
+              "residual_width": {"mlp_fc1": 1152, ...},
+              "chunk_bands":  {"mlp_fc1:0": [0,0,1,1,2,2,3,3,3], ...},
+              "ladders":      {"mlp_fc1:t0:l0": [[...], [...], ...], ...}
+            }
+
+        ``chunk_bands`` is keyed ``"<operator>:<block_idx>"`` and gives the band
+        owning each chunk in ascending chunk order; ``ladders`` is keyed like
+        the ordinary bucket keys and holds ``[n_bands][n_rungs]`` lengths.
+
+        Two invariants are enforced here rather than at runtime, because a
+        silently mispriced allocation looks exactly like a win:
+
+        1. **Whole chunks.** Bands own whole quantization chunks, never
+           individual channels.  The kernel builds its RNG tables over
+           ``chunk_d`` dims and reuses them for every chunk, so relocating a
+           whole chunk is numerically free while relocating arbitrary channels
+           is not.  Every band needs >= 2 chunks to stay on the chunked path.
+
+        2. **Per-rung iso-compute.**  MACs are linear in the contraction dim,
+           so a band's column fraction IS its MAC fraction and the budget is an
+           exact identity rather than a tolerance::
+
+               sum_b (w_b / R) * L[b][k] == L_parent[k]     for every rung k
+
+           Overspend is a hard error.  Underspend is allowed -- a cheaper cell
+           that still wins is a stronger result -- but bounded by
+           ``k_band_underspend_tol``, since a solver leaving many cycles
+           unspent is a bug, not conservatism.
+        """
+        if not section:
+            return
+
+        n_bands = int(section.get("n_bands", 0))
+        if n_bands < 2:
+            raise ValueError(
+                f"k_bands.n_bands must be >= 2 (got {n_bands}); omit the "
+                f"k_bands section entirely to run the per-row parent.")
+        chunk_d = int(section.get("chunk_d", self.k_band_chunk_d))
+        widths_payload = section.get("residual_width") or {}
+        if not widths_payload:
+            raise ValueError(
+                "k_bands.residual_width is required: band widths price the "
+                "iso-compute identity, so the contraction width the allocation "
+                "was solved against must be recorded, not inferred at runtime.")
+        residual_width = {str(op): int(w) for op, w in widths_payload.items()}
+
+        n_rungs = len(self.stoc_len_levels)
+        chunk_bands: dict[tuple[str, int], list[int]] = {}
+        # operator -> band widths, so every block of an operator is checked to
+        # carry the same band map (the ladders are shared across its blocks).
+        op_band_widths: dict[str, list[int]] = {}
+
+        for key_str, band_ids in (section.get("chunk_bands") or {}).items():
+            try:
+                operator, block_part = str(key_str).rsplit(":", 1)
+                block_idx = int(block_part)
+            except Exception as exc:
+                raise ValueError(
+                    f"Invalid k_bands.chunk_bands key '{key_str}'. "
+                    f"Expected '<operator>:<block_idx>'.") from exc
+            if operator not in residual_width:
+                raise ValueError(
+                    f"k_bands.chunk_bands has '{key_str}' but no "
+                    f"residual_width entry for operator '{operator}'.")
+            widths = _chunk_widths(residual_width[operator], chunk_d)
+            bands = [int(b) for b in band_ids]
+            if len(bands) != len(widths):
+                raise ValueError(
+                    f"k_bands.chunk_bands['{key_str}'] has {len(bands)} chunk "
+                    f"entries but operator '{operator}' has {len(widths)} "
+                    f"chunks at chunk_d={chunk_d} "
+                    f"(residual_width={residual_width[operator]}).")
+            for b in bands:
+                if not 0 <= b < n_bands:
+                    raise ValueError(
+                        f"k_bands.chunk_bands['{key_str}'] has a band id "
+                        f"outside [0, {n_bands}): {b}.")
+            # Band count is PER OPERATOR -- n_bands is a maximum. A narrow
+            # projection (9 chunks) tops out around 4 bands while mlp_fc2
+            # (36 chunks) can run 16+, and forcing one global count would
+            # silently drop every narrow operator out of the banded path.
+            op_n_bands = max(bands) + 1
+            if sorted(set(bands)) != list(range(op_n_bands)):
+                raise ValueError(
+                    f"k_bands.chunk_bands['{key_str}'] uses band ids "
+                    f"{sorted(set(bands))}, which skip a band. Ids must be "
+                    f"0..n-1 contiguous: a band's position IS its index into "
+                    f"the ladder.")
+            if op_n_bands < 2:
+                raise ValueError(
+                    f"k_bands.chunk_bands['{key_str}'] uses {op_n_bands} "
+                    f"band(s); drop the operator instead of banding it into "
+                    f"one piece.")
+            for b in range(op_n_bands):
+                owned = sum(1 for x in bands if x == b)
+                if owned < 2:
+                    raise ValueError(
+                        f"k_bands.chunk_bands['{key_str}'] leaves band {b} "
+                        f"with {owned} chunk(s); every band needs >= 2 chunks "
+                        f"to stay on the chunked kernel path. Use fewer bands "
+                        f"for this operator instead.")
+            bw = _band_widths(bands, widths, op_n_bands)
+            prior = op_band_widths.setdefault(operator, bw)
+            if prior != bw:
+                raise ValueError(
+                    f"k_bands.chunk_bands['{key_str}'] gives band widths {bw} "
+                    f"but another block of operator '{operator}' gives "
+                    f"{prior}. Ladders are shared across an operator's blocks, "
+                    f"so the band widths must agree.")
+            chunk_bands[(operator, block_idx)] = bands
+
+        ladders: dict[tuple[str, int, int], list[list[int]]] = {}
+        for bucket_key, payload in (section.get("ladders") or {}).items():
+            operator, t_bucket, l_bucket = _parse_bucket_key(bucket_key)
+            if operator not in op_band_widths:
+                raise ValueError(
+                    f"k_bands.ladders has '{bucket_key}' but no chunk_bands "
+                    f"entry for operator '{operator}'.")
+            band_ladders = [[int(x) for x in rungs] for rungs in payload]
+            op_n_bands = len(op_band_widths[operator])
+            if len(band_ladders) != op_n_bands:
+                raise ValueError(
+                    f"k_bands.ladders['{bucket_key}'] has "
+                    f"{len(band_ladders)} bands but operator '{operator}' is "
+                    f"banded into {op_n_bands}.")
+            for b, rungs in enumerate(band_ladders):
+                if len(rungs) != n_rungs:
+                    raise ValueError(
+                        f"k_bands.ladders['{bucket_key}'] band {b} has "
+                        f"{len(rungs)} rungs, expected {n_rungs} to match "
+                        f"stoc_len_levels {self.stoc_len_levels}. The row's "
+                        f"rung index indexes every band ladder, so they must "
+                        f"agree.")
+                for sl in rungs:
+                    if sl < 0:
+                        raise ValueError(
+                            f"k_bands.ladders['{bucket_key}'] band {b} has a "
+                            f"negative stream length: {sl}.")
+
+            widths = op_band_widths[operator]
+            total_width = float(sum(widths))
+            for k, parent in enumerate(self.stoc_len_levels):
+                spent = sum(
+                    (widths[b] / total_width) * band_ladders[b][k]
+                    for b in range(op_n_bands))
+                if spent > parent * (1.0 + 1e-6):
+                    raise ValueError(
+                        f"k_bands.ladders['{bucket_key}'] overspends rung {k}: "
+                        f"sum_b (w_b/R)*L[b][{k}] = {spent:.6f} > parent "
+                        f"{parent}. MACs are linear in the contraction dim, so "
+                        f"this is an exact identity, not a tolerance.")
+                if parent > 0 and spent < parent * (1.0 - self.k_band_underspend_tol):
+                    raise ValueError(
+                        f"k_bands.ladders['{bucket_key}'] underspends rung {k}: "
+                        f"sum_b (w_b/R)*L[b][{k}] = {spent:.6f} < "
+                        f"{1.0 - self.k_band_underspend_tol:.3f} x parent "
+                        f"{parent}. Leaving that many cycles unspent is a "
+                        f"solver bug; raise k_band_underspend_tol only if the "
+                        f"slack is deliberate.")
+            ladders[(operator, t_bucket, l_bucket)] = band_ladders
+
+        missing = sorted({op for op, _ in chunk_bands} -
+                         {op for op, _, _ in ladders})
+        if missing:
+            raise ValueError(
+                f"k_bands.chunk_bands covers operators {missing} with no "
+                f"ladders entry; those operators would silently fall back to "
+                f"the per-row parent. Add their ladders or drop their "
+                f"chunk_bands.")
+
+        self.k_band_count = n_bands
+        self.k_band_chunk_d = chunk_d
+        self.k_band_chunks = chunk_bands
+        self.k_band_ladders = ladders
+        self.k_band_residual_width = residual_width
+
+    def get_k_bands(
+        self,
+        operator: Optional[str],
+        block_idx: Optional[int],
+        total_blocks: Optional[int] = None,
+        *,
+        timestep: int = 0,
+        total_timesteps: int = 1,
+    ):
+        """``(band_of_chunk, band_ladders)`` for one module, or ``None``.
+
+        ``band_of_chunk[c]`` is the band owning chunk ``c`` in ascending chunk
+        order (tail chunk last); ``band_ladders[b][k]`` is the stream length
+        band ``b`` runs when a row landed on rung ``k``.  ``None`` means this
+        module has no band allocation and must run the per-row parent.
+        """
+        if not self.k_band_count or operator is None or block_idx is None:
+            return None
+        bands = self.k_band_chunks.get((operator, int(block_idx)))
+        if bands is None:
+            return None
+        t_bucket = _bucket_index(timestep, total_timesteps, self.timestep_buckets)
+        l_bucket = (_bucket_index(block_idx, total_blocks, self.layer_buckets)
+                    if total_blocks is not None else 0)
+        band_ladders = self.k_band_ladders.get((operator, t_bucket, l_bucket))
+        if band_ladders is None:
+            return None
+        return bands, band_ladders
 
     def get_thresholds(
         self,
